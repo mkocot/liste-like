@@ -1,4 +1,10 @@
 # listen-like
+
+See for argument description: https://www.freedesktop.org/software/systemd/man/systemd.socket.html
+
+Mimicking interface: https://www.freedesktop.org/software/systemd/man/sd_listen_fds.html#
+
+## Usage
 ```
 Usage: listen-like [OPTION...] -- APP_TO_RUN [args]
 Run me like your fancy systemd
@@ -37,3 +43,24 @@ Run me like your fancy systemd
       --usage                Give a short usage message
   -V, --version              Print program version
 ```
+
+## Example
+Open 2 terminals:
+1. ```
+   ./listen-like --ListenStream=127.0.0.1:1025 -- test
+      App to run: test
+      Arguments: test 
+      Listening: 127.0.0.1:1025
+      ACTIVE FD=3
+      Active fd=0
+      Active fd=1
+      Active fd=2
+      Active fd=3
+      sockets_from_systemd=1
+   ```
+2. ```
+   nc 127.0.0.1 1025
+   HelloWorld
+   ```
+
+   
