@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <argp.h>
-#include <error.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <sys/un.h>
 #include <libgen.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/resource.h>
