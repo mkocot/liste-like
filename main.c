@@ -338,17 +338,17 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    printf("App to run: %s\n", arguments.app_to_run);
-    printf("Arguments: ");
+    fprintf(stderr, "App to run: %s\n", arguments.app_to_run);
+    fprintf(stderr, "Arguments: ");
     for (int i = arguments.copy_args_from; i < argc; ++i)
     {
-        printf("%s ", argv[i]);
+        fprintf(stderr, "%s ", argv[i]);
     }
-    printf("\n");
+    fprintf(stderr, "\n");
 
     for (struct listen_on *lo = &arguments.listeners; lo != NULL;)
     {
-        printf("Listening: %s\n", lo->socket_listen);
+        fprintf(stderr, "Listening: %s\n", lo->socket_listen);
         // check if this is unix socket, wchich may require locking
         if (lo->addr.ss_family == AF_UNIX)
         {
@@ -382,7 +382,7 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        printf("ACTIVE FD=%d\n", lo->fd);
+        fprintf(stderr, "ACTIVE FD=%d\n", lo->fd);
 
         lo = lo->next;
     }
@@ -487,14 +487,14 @@ static int parse_user(const char *v, uid_t *user)
 {
     unsigned long parsed = 0;
 
-    printf("Try parse user: %s\n", v);
+    fprintf(stderr, "Try parse user: %s\n", v);
 
     // this might be 'human readable' or number
     struct passwd *result = getpwnam(v);
     if (result != NULL)
     {
         *user = result->pw_uid;
-        printf("found user %d\n", *user);
+        fprintf(stderr, "found user %d\n", *user);
         return 0;
     }
 
@@ -507,7 +507,7 @@ static int parse_user(const char *v, uid_t *user)
     return 0;
 
 err:
-    printf("not known user: %s\n", v);
+    fprintf(stderr, "not known user: %s\n", v);
     return EINVAL;
 }
 
@@ -543,7 +543,7 @@ static int parse_mode(const char *v, mode_t *mode)
     return 0;
 
 err:
-    printf("value (%s) not valid mode\n", v);
+    fprintf(stderr, "value (%s) not valid mode\n", v);
     return EINVAL;
 }
 
@@ -617,7 +617,7 @@ static int parse_addr(const char *v, int type, struct listen_on *lo)
     char *p_semicolon = strchr(v, ':');
     if (p_semicolon == NULL)
     {
-        printf("missing port in endpoint\n");
+        fprintf(stderr, "missing port in endpoint\n");
         goto err;
     }
 
@@ -632,7 +632,7 @@ static int parse_addr(const char *v, int type, struct listen_on *lo)
         }
         else
         {
-            printf("Unable to resolve address: %s\n", v);
+            fprintf(stderr, "Unable to resolve address: %s\n", v);
         }
         goto err;
     }
@@ -643,13 +643,13 @@ static int parse_addr(const char *v, int type, struct listen_on *lo)
 
     if (serverinfo->ai_family != lo->addr.ss_family)
     {
-        printf("Family missmatch\n");
+        fprintf(stderr, "Family missmatch\n");
         exit(1);
     }
 
     if (serverinfo->ai_socktype != type)
     {
-        printf("SOCKTYPE missmatch\n");
+        fprintf(stderr, "SOCKTYPE missmatch\n");
         exit(1);
     }
 
@@ -722,7 +722,7 @@ static error_t parser(int key, char arg[], struct argp_state *state)
         return parse_uint32(arg, &lo->recv_buffer);
     case ARG_IP_TOS:
         // IPTOS_LOWDELAY and company
-        printf("WARNING: ToS has been deprecated. Use DSCP\n");
+        fprintf(stderr, "WARNING: ToS has been deprecated. Use DSCP\n");
         return parse_uint32(arg, &lo->tos);
     case ARG_IP_TTL:
         return parse_uint32(arg, &lo->ttl);
@@ -734,7 +734,7 @@ static error_t parser(int key, char arg[], struct argp_state *state)
     case ARGP_KEY_ARG:
         if (!state->quoted)
         {
-            printf("Application to run and it's arguments should be set after --\n");
+            fprintf(stderr, "Application to run and it's arguments should be set after --\n");
             return ARGP_ERR_UNKNOWN;
         }
         if (state->arg_num == 0)
@@ -744,13 +744,11 @@ static error_t parser(int key, char arg[], struct argp_state *state)
             state->next = state->argc;
             break;
         }
-        printf("SHOULD NET BE HERE: next=%d\n", state->next);
+        fprintf(stderr, "SHOULD NET BE HERE: next=%d\n", state->next);
         break;
     case ARGP_KEY_END:
-        printf("ARG_KE: %d\n", state->arg_num);
         if (state->arg_num < 1)
         {
-            printf("return error\n");
             // argp_err_exit_status = EINVAL;
             argp_state_help(state, stdout, ARGP_HELP_STD_HELP | ARGP_HELP_EXIT_ERR);
             argp_error(state, "missing whay you want to run");
@@ -769,7 +767,7 @@ int set_tos(int fd, int tos)
     int masked = tos & IPTOS_TOS_MASK;
     if (masked != tos)
     {
-        printf("Invalid tos value: %d (%d)\n", tos, masked);
+        fprintf(stderr, "Invalid tos value: %d (%d)\n", tos, masked);
         return EINVAL;
     }
     return setsockopt(fd, IPPROTO_IP, IP_TOS, &masked, sizeof(masked));
@@ -848,7 +846,7 @@ static int set_options(const struct listen_on *lo)
     if (lo->mark && set_sol(fd, SO_MARK, lo->mark))
     {
         perror("SO_MARK");
-        printf("Unable to set mark %u to %s\n", lo->mark, lo->socket_listen);
+        fprintf(stderr, "Unable to set mark %u to %s\n", lo->mark, lo->socket_listen);
         return 1;
     }
 
@@ -949,14 +947,14 @@ static int lock_unix_socket(const struct sockaddr_un *unix_addr)
     if (flock_fd < 0)
     {
         perror("open");
-        printf("Unable to create lock file: %s\n", path);
+        fprintf(stderr, "Unable to create lock file: %s\n", path);
         return 1;
     }
 
     if (flock(flock_fd, LOCK_EX | LOCK_NB))
     {
         perror("flock");
-        printf("Someone else is using socket: %s\n", unix_addr->sun_path);
+        fprintf(stderr, "Someone else is using socket: %s\n", unix_addr->sun_path);
         return 1;
     }
 
@@ -964,7 +962,7 @@ static int lock_unix_socket(const struct sockaddr_un *unix_addr)
     if (ret != 0 && errno != ENOENT)
     {
         perror("unlink");
-        printf("Unable to unlink socket file: %s\n", unix_addr->sun_path);
+        fprintf(stderr, "Unable to unlink socket file: %s\n", unix_addr->sun_path);
         return 1;
     }
     return 0;
