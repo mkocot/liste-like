@@ -82,7 +82,10 @@ static struct argp_option args[] = {
     {"ListenStream", ARG_LISTEN_STREAM, "STREAM"},
     {"ListenDatagram", ARG_LISTEN_DATAGRAM, "DATAGRAM"},
     {"ListenSequentialPacket", ARG_LISTEN_SEQ, "SEQ"},
-    {"SocketProtocol", ARG_SOCKET_PROTOCOL, "PROT"},
+    {"SocketProtocol", ARG_SOCKET_PROTOCOL, "PROT", 0,
+     "Think twice before using it. Most protocol only accept 0 as valid value."
+     " Using SocketProtocol might result in hard to debug errors."
+    },
     {"Backlog", ARG_BACKLOG, "BACKLOG"},
     {"SocketUser", ARG_SOCKET_USER, "USER"},
     {"SocketGroup", ARG_SOCKET_GROUP, "GROUP"},
@@ -125,17 +128,7 @@ struct keep_alive
     uint32_t probes;
 };
 
-/* marks what feature is set to distinguis deliberate 0 value for expected 0 */
-enum listen_on_options
-{
-    LO_REUSE_PORT = 0 << 1,
-    LO_REUSE_ADDR = 1 << 1,
-    LO_RECV_BUFFER = 2 << 1,
-    LO_SEND_BUFFER = 3 << 1,
-    LO_PRIORITY = 4 << 1,
-    LO_TOS = 5 << 1,
-    LO_TTL = 6 << 1,
-};
+static int keepalive_setup_fd(int fd, const struct keep_alive *ka);
 
 struct listen_on
 {
@@ -162,14 +155,28 @@ struct listen_on
     /* IP_TTL */
     uint32_t ttl;
 
-    /* SO_REUSEPORT */
-    bool reuse_port;
-    /* SO_REUSEADDR */
-    bool reuse_addr;
+    union {
+        uint32_t flags;
+        struct {
+            /* SO_REUSEPORT */
+            int reuse_port:1;
+            /* SO_REUSEADDR */
+            int reuse_addr:1;
+        };
+    };
 
     int fd;
+    int socket_type;
     uint32_t socket_protocol;
 };
+
+static int listen_on_set_fd_options(const struct listen_on *lo);
+static struct listen_on *listen_on_new(struct listen_on *base);
+static int listen_on_size(struct listen_on *base);
+static void listen_on_free(struct listen_on *lo);
+static const char* listen_on_family_to_text(const struct listen_on *lo);
+static const char* listen_on_type(const struct listen_on *lo);
+static const char* listen_on_proto(const struct listen_on *lo);
 
 struct arguments
 {
@@ -191,7 +198,32 @@ struct arguments
     int backlog;
 };
 
-static struct listen_on *new_listen_on(struct listen_on *base)
+static void arguments_free(struct arguments *args);
+static struct listen_on *arguments_obtain_listen_on(struct arguments *args);
+static int arguments_create_path(const char *path, const struct arguments *arguments);
+
+/* parse methods */
+static int parse_ushort(const char *v, unsigned short *out);
+static int parse_ulong(const char *v, const int base, unsigned long *out);
+static int parse_int(const char *v, int *out);
+static int parse_uint32(const char *v, uint32_t *out);
+static int parse_user(const char *v, uid_t *user);
+static int parse_group(const char *v, gid_t *group);
+static int parse_mode(const char *v, mode_t *mode);
+static int parse_addr(const char *v, struct listen_on *lo);
+
+/* misc */
+static int set_tos(int fd, int tos);
+static int set_dscp(int fd, int dscp);
+static int set_ttl(int fd, int ttl);
+static int lock_unix_socket(const struct sockaddr_un *unix_addr);
+static int open_or_mkdir(int fd, const char *name, mode_t mode);
+static int set_sol(int fd, int arg, uint32_t opt);
+static int set_tcpopt(int fd, int arg, int val);
+
+/* listen_on impl */
+
+static struct listen_on *listen_on_new(struct listen_on *base)
 {
     struct listen_on *lo = base;
     while (lo->next)
@@ -229,43 +261,143 @@ static void listen_on_free(struct listen_on *lo)
     }
 }
 
+static const char* listen_on_family_to_text(const struct listen_on *lo)
+{
+    // unix, tcp, seq, udp
+    switch (lo->addr.ss_family)
+    {
+    case AF_UNIX:
+        return "unix";
+    case AF_PACKET:
+        return "packet";
+    case AF_INET:
+        return "inet";
+    default:
+        return "unknown family";
+    }
+}
+
+static const char* listen_on_type(const struct listen_on *lo)
+{
+    switch(lo->socket_type)
+    {
+        case SOCK_DGRAM:
+            return "dgram";
+        case SOCK_STREAM:
+            return "stream";
+        case SOCK_SEQPACKET:
+            return "seq";
+        default:
+            return "unknown type";
+    }
+}
+
+static const char* listen_on_proto(const struct listen_on *lo)
+{
+    if (lo->addr.ss_family == AF_UNIX) {
+        /* no proto for unix */
+        return "no proto";
+    }
+
+    switch(lo->socket_protocol) {
+        case IPPROTO_UDP:
+            return "udp";
+        case IPPROTO_TCP:
+            return "tcp";
+        default:
+            return "unknown proto";
+    }
+}
+
+static int listen_on_set_fd_options(const struct listen_on *lo)
+{
+    int fd = lo->fd;
+
+    if (lo->mark && set_sol(fd, SO_MARK, lo->mark))
+    {
+        perror("SO_MARK");
+        fprintf(stderr, "Unable to set mark %u to %s\n", lo->mark, lo->socket_listen);
+        return 1;
+    }
+
+    if (lo->priority && set_sol(fd, SO_PRIORITY, lo->priority))
+    {
+        perror("priority");
+        return 1;
+    }
+
+    if (lo->reuse_port && set_sol(fd, SO_REUSEPORT, 1))
+    {
+        perror("reuse port");
+        return 1;
+    }
+
+    if (lo->reuse_addr && set_sol(fd, SO_REUSEADDR, 1))
+    {
+        perror("reuse addr");
+        return 1;
+    }
+
+    if (keepalive_setup_fd(fd, &lo->keep_alive))
+    {
+        perror("keepalive");
+        return 1;
+    }
+
+    if (lo->recv_buffer && set_sol(fd, SO_RCVBUF, lo->recv_buffer))
+    {
+        perror("rcv");
+        return 1;
+    }
+
+    if (lo->send_buffer && set_sol(fd, SO_SNDBUF, lo->send_buffer))
+    {
+        perror("snd");
+        return 1;
+    }
+
+    if (lo->ttl && set_ttl(fd, lo->ttl))
+    {
+        perror("ttl");
+        return 1;
+    }
+
+    if (lo->tos && set_tos(fd, lo->tos))
+    {
+        perror("tos");
+        return 1;
+    }
+
+    /* ToS is deprecated, so ensure dscp is set after it  in case where
+       both values are present
+    */
+    if (lo->dscp && set_dscp(fd, lo->dscp))
+    {
+        perror("DSCP");
+        return 1;
+    }
+
+    return 0;
+}
+
+/* arguments impl */
+
+static struct listen_on *arguments_obtain_listen_on(struct arguments *args)
+{
+    if (args->listeners.addr.ss_family == 0)
+    {
+        return &args->listeners;
+    }
+    return listen_on_new(&args->listeners);
+}
+
 static void arguments_free(struct arguments *args)
 {
     /* use next, base is not malloced */
     listen_on_free(args->listeners.next);
 }
 
-static struct listen_on *obtain_listen_on(struct arguments *args)
-{
-    if (args->listeners.addr.ss_family == 0)
-    {
-        return &args->listeners;
-    }
-    return new_listen_on(&args->listeners);
-}
-
-static int open_or_mkdir(int fd, const char *name, mode_t mode)
-{
-    if (mkdirat(fd, name, mode) && errno != EEXIST)
-    {
-        return -1;
-    }
-
-    int dir = openat(fd, name, O_CLOEXEC | O_DIRECTORY | O_RDONLY);
-    return dir;
-}
-
-int is_unix_socket_on_fs(struct listen_on const *lo)
-{
-    if (lo->addr.ss_family != AF_UNIX)
-    {
-        return 0;
-    }
-    const struct sockaddr_un *sun = (const struct sockaddr_un *)&lo->addr;
-    return sun->sun_path[0] != '\0';
-}
-
-static int create_path(const char *path, const struct arguments *arguments)
+static int arguments_create_path(const char *path, const struct arguments *arguments)
 {
     /* This is 'hack' as path should always be sun_path */
     char path_dup[sizeof(((struct sockaddr_un *)NULL)->sun_path)];
@@ -302,123 +434,45 @@ static int create_path(const char *path, const struct arguments *arguments)
     return 0;
 }
 
-static int set_sol(int fd, int arg, uint32_t opt)
+/* keepalive impl */
+
+int keepalive_setup_fd(int fd, const struct keep_alive *keep_alive)
 {
-    return setsockopt(fd, SOL_SOCKET, arg, &opt, sizeof(opt));
+    if (!keep_alive->enable)
+    {
+        return 0;
+    }
+
+    if (set_sol(fd, SO_KEEPALIVE, keep_alive->enable))
+    {
+        perror("keepalive");
+        exit(1);
+    }
+
+    if (keep_alive->time && set_tcpopt(fd, TCP_KEEPIDLE, keep_alive->time))
+    {
+        perror("keepidle");
+        exit(1);
+    }
+
+    if (keep_alive->probes && set_tcpopt(fd, TCP_KEEPCNT, keep_alive->probes))
+    {
+        perror("keepcnt");
+        exit(1);
+    }
+
+    if (keep_alive->interval && set_tcpopt(fd, TCP_KEEPINTVL, keep_alive->interval))
+    {
+        perror("keepintv");
+        exit(1);
+    }
+
+    return 0;
 }
 
-static int set_tos(int fd, int tos);
-static int set_dscp(int fd, int dscp);
-static int set_ttl(int fd, int ttl);
-static int set_keepalive(int fd, struct keep_alive ka);
-static int set_options(const struct listen_on *lo);
-static int lock_unix_socket(const struct sockaddr_un *unix_addr);
+/* parsers impl */
 
-int main(int argc, char *argv[])
-{
-    /*
-        FOR THE LOVE OF... ENSURE ALL DESCRIPTORS NOT MEANT TO BE PASSED DOWN
-        ARE USING O_CLOEXEC
-    */
-    argp_program_version_hook = version_printer;
-    struct arguments arguments = {0};
-    arguments.socket_mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH; /* 666 */
-    arguments.directory_mode = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;        /* 755 */
-    arguments.user = getuid();
-    arguments.group = getgid();
-    arguments.backlog = 128;
-
-    if (argp_parse(&argp, argc, argv, 0, 0, &arguments))
-    {
-        argp_help(&argp, stderr, ARGP_HELP_STD_HELP, argv[0]);
-        exit(1);
-    }
-
-    if (arguments.app_to_run == NULL || strlen(arguments.app_to_run) == 0)
-    {
-        argp_help(&argp, stderr, ARGP_HELP_STD_HELP, argv[0]);
-        exit(1);
-    }
-
-    fprintf(stderr, "App to run: %s\n", arguments.app_to_run);
-    fprintf(stderr, "Arguments: ");
-    for (int i = arguments.copy_args_from; i < argc; ++i)
-    {
-        fprintf(stderr, "%s ", argv[i]);
-    }
-    fprintf(stderr, "\n");
-
-    for (struct listen_on *lo = &arguments.listeners; lo != NULL;)
-    {
-        fprintf(stderr, "Listening: %s\n", lo->socket_listen);
-        // check if this is unix socket, wchich may require locking
-        if (lo->addr.ss_family == AF_UNIX)
-        {
-            // create parent directiries
-            struct sockaddr_un *unix_addr = (struct sockaddr_un *)&lo->addr;
-            if (create_path(unix_addr->sun_path, &arguments))
-            {
-                exit(1);
-            }
-
-            if (arguments.lock_unix_socket && lock_unix_socket(unix_addr))
-            {
-                exit(1);
-            }
-        }
-
-        if (set_options(lo))
-        {
-            exit(1);
-        }
-
-        if (bind(lo->fd, (struct sockaddr *)&lo->addr, lo->addr_len))
-        {
-            perror("bind");
-            exit(1);
-        }
-
-        /* listen is not working on: UDP*/
-        if (lo->socket_protocol != IPPROTO_UDP)
-        {
-            if (listen(lo->fd, arguments.backlog))
-            {
-                perror("listen");
-                exit(1);
-            }
-        }
-
-        fprintf(stderr, "ACTIVE FD=%d\n", lo->fd);
-
-        lo = lo->next;
-    }
-
-    /* mimic systemd */
-    char tmp[16] = {0};
-    snprintf(tmp, sizeof(tmp) - 1, "%d", getpid()); /* NOLINT */
-    setenv("LISTEN_PID", tmp, 1);
-
-    /* NOLINTNEXTLINE */
-    snprintf(tmp, sizeof(tmp) - 1, "%d", listen_on_size(&arguments.listeners));
-    setenv("LISTEN_FDS", tmp, 1);
-
-    setenv("LISTEN_FDNAMES", "", 1);
-
-    struct rlimit limits = {0};
-    if (getrlimit(RLIMIT_NOFILE, &limits))
-    {
-        perror("getrlimit");
-        exit(1);
-    }
-
-    /* cleanup mess */
-    arguments_free(&arguments);
-
-    /* app_to_run == argv[copy_args_from] */
-    return execv(arguments.app_to_run, argv + arguments.copy_args_from);
-}
-
-static int parse_ul(const char *v, const int base, unsigned long *out)
+static int parse_ulong(const char *v, const int base, unsigned long *out)
 {
     char *end = NULL;
     *out = strtoul(v, &end, base);
@@ -436,10 +490,10 @@ static int parse_ul(const char *v, const int base, unsigned long *out)
     return 0;
 }
 
-static int parse_int10(const char *v, int *out)
+static int parse_int(const char *v, int *out)
 {
     unsigned long parsed = 0;
-    if (parse_ul(v, 10, &parsed))
+    if (parse_ulong(v, 10, &parsed))
     {
         return EINVAL;
     }
@@ -450,7 +504,7 @@ static int parse_int10(const char *v, int *out)
 static int parse_uint32(const char *v, uint32_t *out)
 {
     unsigned long parsed = 0;
-    if (parse_ul(v, 10, &parsed))
+    if (parse_ulong(v, 10, &parsed))
     {
         return EINVAL;
     }
@@ -504,7 +558,7 @@ static int parse_user(const char *v, uid_t *user)
         return 0;
     }
 
-    if (parse_ul(v, 10, &parsed))
+    if (parse_ulong(v, 10, &parsed))
     {
         goto err;
     }
@@ -521,7 +575,7 @@ static int parse_group(const char *v, gid_t *group)
 {
     unsigned long parsed = 0;
 
-    if (parse_ul(v, 10, &parsed))
+    if (parse_ulong(v, 10, &parsed))
     {
         goto err;
     }
@@ -535,7 +589,7 @@ static int parse_mode(const char *v, mode_t *mode)
 {
     const mode_t MAX_MODE = S_IRWXU | S_IRWXG | S_IRWXO;
     unsigned long parsed = 0;
-    if (parse_ul(v, 8, &parsed))
+    if (parse_ulong(v, 8, &parsed))
     {
         goto err;
     }
@@ -553,10 +607,10 @@ err:
     return EINVAL;
 }
 
-static int parse_us(const char *v, unsigned short *out)
+static int parse_ushort(const char *v, unsigned short *out)
 {
     unsigned long parsed = 0;
-    if (parse_ul(v, 10, &parsed))
+    if (parse_ulong(v, 10, &parsed))
     {
         return EINVAL;
     }
@@ -569,11 +623,12 @@ static int parse_us(const char *v, unsigned short *out)
     *out = (unsigned short)parsed;
     return 0;
 }
-static int parse_addr(const char *v, int type, struct listen_on *lo)
+
+static int parse_addr(const char *v, struct listen_on *lo)
 {
     unsigned short port = 0;
 
-    if (parse_us(v, &port) == 0)
+    if (parse_ushort(v, &port) == 0)
     {
         // Good, only port listen on any address
         struct sockaddr_in *in = (struct sockaddr_in *)&lo->addr;
@@ -612,7 +667,7 @@ static int parse_addr(const char *v, int type, struct listen_on *lo)
 
     struct addrinfo hints = {
         .ai_family = AF_UNSPEC,
-        .ai_socktype = type,
+        .ai_socktype = lo->socket_type,
         .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV,
     };
     struct addrinfo *serverinfo = NULL;
@@ -652,18 +707,22 @@ static int parse_addr(const char *v, int type, struct listen_on *lo)
         exit(1);
     }
 
-    if (serverinfo->ai_socktype != type)
+    if (serverinfo->ai_socktype != lo->socket_type)
     {
         fprintf(stderr, "SOCKTYPE missmatch\n");
         exit(1);
     }
 
-    lo->socket_protocol = serverinfo->ai_protocol;
+    if (lo->socket_protocol == 0)
+    {
+        lo->socket_protocol = serverinfo->ai_protocol;
+    }
+
     freeaddrinfo(serverinfo);
 
 ok:
     lo->socket_listen = v;
-    lo->fd = socket(lo->addr.ss_family, type, lo->socket_protocol);
+    lo->fd = socket(lo->addr.ss_family, lo->socket_type, lo->socket_protocol);
     if (lo->fd < 0)
     {
         perror("socket");
@@ -674,6 +733,7 @@ ok:
 err:
     return EINVAL;
 }
+
 static error_t parser(int key, char arg[], struct argp_state *state)
 {
     struct arguments *arguments = state->input;
@@ -691,16 +751,19 @@ static error_t parser(int key, char arg[], struct argp_state *state)
     case ARG_SOCKET_GROUP:
         return parse_group(arg, &arguments->group);
     case ARG_BACKLOG:
-        return parse_int10(arg, &arguments->backlog);
+        return parse_int(arg, &arguments->backlog);
     case ARG_LISTEN_STREAM:
-        lo = obtain_listen_on(arguments);
-        return parse_addr(arg, SOCK_STREAM, lo);
+        lo = arguments_obtain_listen_on(arguments);
+        lo->socket_type = SOCK_STREAM;
+        return parse_addr(arg, lo);
     case ARG_LISTEN_DATAGRAM:
-        lo = obtain_listen_on(arguments);
-        return parse_addr(arg, SOCK_DGRAM, lo);
+        lo->socket_type = SOCK_DGRAM;
+        lo = arguments_obtain_listen_on(arguments);
+        return parse_addr(arg, lo);
     case ARG_LISTEN_SEQ:
-        lo = obtain_listen_on(arguments);
-        return parse_addr(arg, SOCK_SEQPACKET, lo);
+        lo = arguments_obtain_listen_on(arguments);
+        lo->socket_type = SOCK_SEQPACKET;
+        return parse_addr(arg, lo);
     case ARG_LOCK_UNIX_SOCKETS:
         arguments->lock_unix_socket = 1;
         break;
@@ -735,6 +798,9 @@ static error_t parser(int key, char arg[], struct argp_state *state)
         return parse_uint32(arg, &lo->priority);
     case ARG_IP_DSCP:
         return parse_uint32(arg, &lo->dscp);
+    case ARG_SOCKET_PROTOCOL:
+        fprintf(stderr, "WARNING: Using SocketProtocol might result in hard to debug errors\n");
+        return parse_uint32(arg, &lo->socket_protocol);
 
     case ARGP_KEY_ARG:
         if (!state->quoted)
@@ -764,6 +830,24 @@ static error_t parser(int key, char arg[], struct argp_state *state)
         return ARGP_ERR_UNKNOWN;
     }
     return 0;
+}
+
+/* misc impl */
+
+static int open_or_mkdir(int fd, const char *name, mode_t mode)
+{
+    if (mkdirat(fd, name, mode) && errno != EEXIST)
+    {
+        return -1;
+    }
+
+    int dir = openat(fd, name, O_CLOEXEC | O_DIRECTORY | O_RDONLY);
+    return dir;
+}
+
+static int set_sol(int fd, int arg, uint32_t opt)
+{
+    return setsockopt(fd, SOL_SOCKET, arg, &opt, sizeof(opt));
 }
 
 /* be warned: this is deprecated, and wild thing might happen */
@@ -808,111 +892,6 @@ int set_ttl(int fd, int ttl)
 static int set_tcpopt(int fd, int arg, int val)
 {
     return setsockopt(fd, SOL_TCP, arg, &val, sizeof(val));
-}
-
-int set_keepalive(int fd, struct keep_alive keep_alive)
-{
-    if (!keep_alive.enable)
-    {
-        return 0;
-    }
-
-    if (set_sol(fd, SO_KEEPALIVE, keep_alive.enable))
-    {
-        perror("keepalive");
-        exit(1);
-    }
-
-    if (keep_alive.time && set_tcpopt(fd, TCP_KEEPIDLE, keep_alive.time))
-    {
-        perror("keepidle");
-        exit(1);
-    }
-
-    if (keep_alive.probes && set_tcpopt(fd, TCP_KEEPCNT, keep_alive.probes))
-    {
-        perror("keepcnt");
-        exit(1);
-    }
-
-    if (keep_alive.interval && set_tcpopt(fd, TCP_KEEPINTVL, keep_alive.interval))
-    {
-        perror("keepintv");
-        exit(1);
-    }
-
-    return 0;
-}
-
-static int set_options(const struct listen_on *lo)
-{
-    int fd = lo->fd;
-
-    if (lo->mark && set_sol(fd, SO_MARK, lo->mark))
-    {
-        perror("SO_MARK");
-        fprintf(stderr, "Unable to set mark %u to %s\n", lo->mark, lo->socket_listen);
-        return 1;
-    }
-
-    if (lo->priority && set_sol(fd, SO_PRIORITY, lo->priority))
-    {
-        perror("priority");
-        return 1;
-    }
-
-    if (lo->reuse_port && set_sol(fd, SO_REUSEPORT, lo->reuse_port))
-    {
-        perror("reuse port");
-        return 1;
-    }
-
-    if (lo->reuse_addr && set_sol(fd, SO_REUSEADDR, lo->reuse_addr))
-    {
-        perror("reuse addr");
-        return 1;
-    }
-
-    if (set_keepalive(fd, lo->keep_alive))
-    {
-        perror("keepalive");
-        return 1;
-    }
-
-    if (lo->recv_buffer && set_sol(fd, SO_RCVBUF, lo->recv_buffer))
-    {
-        perror("rcv");
-        return 1;
-    }
-
-    if (lo->send_buffer && set_sol(fd, SO_SNDBUF, lo->send_buffer))
-    {
-        perror("snd");
-        return 1;
-    }
-
-    if (lo->ttl && set_ttl(fd, lo->ttl))
-    {
-        perror("ttl");
-        return 1;
-    }
-
-    if (lo->tos && set_tos(fd, lo->tos))
-    {
-        perror("tos");
-        return 1;
-    }
-
-    /* ToS is deprecated, so ensure dscp is set after it  in case where
-       both values are present
-    */
-    if (lo->dscp && set_dscp(fd, lo->dscp))
-    {
-        perror("DSCP");
-        return 1;
-    }
-
-    return 0;
 }
 
 static int lock_unix_socket(const struct sockaddr_un *unix_addr)
@@ -971,4 +950,116 @@ static int lock_unix_socket(const struct sockaddr_un *unix_addr)
         return 1;
     }
     return 0;
+}
+
+/* main */
+
+int main(int argc, char *argv[])
+{
+    /*
+        FOR THE LOVE OF... ENSURE ALL DESCRIPTORS NOT MEANT TO BE PASSED DOWN
+        ARE USING O_CLOEXEC
+    */
+    argp_program_version_hook = version_printer;
+    struct arguments arguments = {0};
+    arguments.socket_mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH; /* 666 */
+    arguments.directory_mode = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;        /* 755 */
+    arguments.user = getuid();
+    arguments.group = getgid();
+    arguments.backlog = 128;
+
+    if (argp_parse(&argp, argc, argv, 0, 0, &arguments))
+    {
+        argp_help(&argp, stderr, ARGP_HELP_STD_HELP, argv[0]);
+        exit(1);
+    }
+
+    if (arguments.app_to_run == NULL || strlen(arguments.app_to_run) == 0)
+    {
+        argp_help(&argp, stderr, ARGP_HELP_STD_HELP, argv[0]);
+        exit(1);
+    }
+
+    fprintf(stderr, "App to run: %s\n", arguments.app_to_run);
+    fprintf(stderr, "Arguments: ");
+    for (int i = arguments.copy_args_from; i < argc; ++i)
+    {
+        fprintf(stderr, "%s ", argv[i]);
+    }
+    fprintf(stderr, "\n");
+
+    for (struct listen_on *lo = &arguments.listeners; lo != NULL;)
+    {
+        fprintf(stderr,
+            "Listening: %s, %s(%s, %s)\n",
+            lo->socket_listen,
+            listen_on_type(lo),
+            listen_on_proto(lo),
+            listen_on_family_to_text(lo)
+            );
+        // check if this is unix socket, wchich may require locking
+        if (lo->addr.ss_family == AF_UNIX)
+        {
+            // create parent directiries
+            struct sockaddr_un *unix_addr = (struct sockaddr_un *)&lo->addr;
+            if (arguments_create_path(unix_addr->sun_path, &arguments))
+            {
+                exit(1);
+            }
+
+            if (arguments.lock_unix_socket && lock_unix_socket(unix_addr))
+            {
+                exit(1);
+            }
+        }
+
+        if (listen_on_set_fd_options(lo))
+        {
+            exit(1);
+        }
+
+        if (bind(lo->fd, (struct sockaddr *)&lo->addr, lo->addr_len))
+        {
+            perror("bind");
+            exit(1);
+        }
+
+        /* listen is not working on: UDP*/
+        if (lo->socket_protocol != IPPROTO_UDP)
+        {
+            if (listen(lo->fd, arguments.backlog))
+            {
+                perror("listen");
+                exit(1);
+            }
+        }
+
+        fprintf(stderr, "ACTIVE FD=%d\n", lo->fd);
+
+        lo = lo->next;
+    }
+
+    /* mimic systemd */
+    char tmp[16] = {0};
+    snprintf(tmp, sizeof(tmp) - 1, "%d", getpid()); /* NOLINT */
+    setenv("LISTEN_PID", tmp, 1);
+
+    /* NOLINTNEXTLINE */
+    snprintf(tmp, sizeof(tmp) - 1, "%d", listen_on_size(&arguments.listeners));
+    setenv("LISTEN_FDS", tmp, 1);
+
+    setenv("LISTEN_FDNAMES", "", 1);
+
+    struct rlimit limits = {0};
+    if (getrlimit(RLIMIT_NOFILE, &limits))
+    {
+        perror("getrlimit");
+        exit(1);
+    }
+
+    /* cleanup mess */
+    arguments_free(&arguments);
+
+    /* app_to_run == argv[copy_args_from] */
+    return execv(arguments.app_to_run, argv + arguments.copy_args_from);
 }
