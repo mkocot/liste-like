@@ -168,6 +168,7 @@ struct listen_on
     bool reuse_addr;
 
     int fd;
+    uint32_t socket_protocol;
 };
 
 struct arguments
@@ -377,10 +378,14 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        if (listen(lo->fd, arguments.backlog))
+        /* listen is not working on: UDP*/
+        if (lo->socket_protocol != IPPROTO_UDP)
         {
-            perror("listen");
-            exit(1);
+            if (listen(lo->fd, arguments.backlog))
+            {
+                perror("listen");
+                exit(1);
+            }
         }
 
         fprintf(stderr, "ACTIVE FD=%d\n", lo->fd);
@@ -567,7 +572,6 @@ static int parse_us(const char *v, unsigned short *out)
 static int parse_addr(const char *v, int type, struct listen_on *lo)
 {
     unsigned short port = 0;
-    int socket_protocol = 0;
 
     if (parse_us(v, &port) == 0)
     {
@@ -654,12 +658,12 @@ static int parse_addr(const char *v, int type, struct listen_on *lo)
         exit(1);
     }
 
-    socket_protocol = serverinfo->ai_protocol;
+    lo->socket_protocol = serverinfo->ai_protocol;
     freeaddrinfo(serverinfo);
 
 ok:
     lo->socket_listen = v;
-    lo->fd = socket(lo->addr.ss_family, type, socket_protocol);
+    lo->fd = socket(lo->addr.ss_family, type, lo->socket_protocol);
     if (lo->fd < 0)
     {
         perror("socket");
